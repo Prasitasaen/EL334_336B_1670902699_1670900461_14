@@ -1,0 +1,432 @@
+#include "MK64F12.h"
+
+#define BUZZ_ACTIVE_LOW  1   
+#define BUZZER_PASSIVE   0   
+
+#define CALL_COUNT_BEEP  0   
+#define MAX_BEEPS        9   
+#define BEEP_ON_MS       120
+#define BEEP_GAP_MS      150
+
+#define BLANK_MS     120     
+#define DEBOUNCE_MS  20
+#define IDLE_MS      4000    
+#define LONG_MS      1000   
+#define RESET_MS     2000    
+
+#define SERIES_COUNT 6  
+#define PER_SERIES   99                        
+#define MAX_QUEUE    (SERIES_COUNT * PER_SERIES)
+
+#define USE_WFI      1
+#define LATCH_PIN   23u     /* PTB23 */
+#define CLOCK_PIN   3u      /* PTC3  */
+#ifdef FRDM_K64F_REV_D
+#define DATA_GPIO PTA
+#define DATA_PORT PORTA
+#define DATA_PIN  0u
+#else
+#define DATA_GPIO PTC
+#define DATA_PORT PORTC
+#define DATA_PIN  12u
+#endif
+#define S1_PIN      3u      /* PTB3  */
+#define S2_PIN      10u     /* PTB10 */
+#define S3_PIN      11u     /* PTB11 */
+#define LED1_PIN    1u      /* PTD1 */
+#define LED2_PIN    3u      /* PTD3 */
+#define LED3_PIN    2u      /* PTD2 */
+#define BUZZ_PIN    1u      /* PTA1 */
+#define LED1_MASK   (1u << LED1_PIN)
+#define LED2_MASK   (1u << LED2_PIN)
+#define LED3_MASK   (1u << LED3_PIN)
+#define LED_ALL     (LED1_MASK | LED2_MASK | LED3_MASK)
+#if BUZZ_ACTIVE_LOW
+
+#define BUZZ_ON()   do { PTA->PCOR = (1u << BUZZ_PIN); PTA->PDDR |=  (1u << BUZZ_PIN); } while (0)
+#define BUZZ_OFF()  do { PTA->PDDR &= ~(1u << BUZZ_PIN); } while (0)
+#else
+
+#define BUZZ_ON()   do { PTA->PSOR = (1u << BUZZ_PIN); PTA->PDDR |=  (1u << BUZZ_PIN); } while (0)
+#define BUZZ_OFF()  do { PTA->PDDR &= ~(1u << BUZZ_PIN); } while (0)
+#endif
+
+static int issuedQueue  = 0; 
+static int calledQueue  = 0;   
+static int waitingQueue = 0;   
+
+typedef enum { VIEW_CALLED = 0, VIEW_TICKET, VIEW_ISSUED, VIEW_WAITING } View;
+static View view = VIEW_CALLED;
+static int  ticketFmt = 1;     
+static volatile int      displayValue = 0;   
+static volatile uint32_t msTicks = 0;
+static uint8_t  dotMask      = 0;      
+static uint32_t blankEnd     = 0;      
+static uint32_t lastActivity = 0;    
+
+typedef struct { uint16_t freq; uint16_t ms; } Note;  
+
+#define N_E5   659
+#define N_G5   784
+#define N_C6  1047
+#define N_E6  1319
+#define N_G6  1568
+#define N_G3   196
+#define N_C4   262
+static const Note SND_ISSUE[] = {              /* S1*/
+  { N_E6, 70 }
+};
+static const Note SND_TOTAL[] = {              /* S2*/
+  { N_C6, 50 }, { 0, 60 }, { N_C6, 50 }
+};
+static const Note SND_CALL[] = {               /* S3 (CALL_COUNT_BEEP = 0)*/
+  { N_G5, 180 }, { 0, 40 }, { N_E5, 420 }
+};
+static const Note SND_NONE[] = {               /* S3*/
+  { N_C4, 130 }, { 0, 60 }, { N_G3, 260 }
+};
+static const Note SND_FULL[] = {              
+  { N_C4, 200 }, { 0, 80 }, { N_C4, 200 }, { 0, 80 }, { N_C4, 200 }
+};
+static const Note SND_RESET[] = {              
+  { N_C6, 80 }, { 0, 60 }, { N_E6, 80 }, { 0, 60 }, { N_G6, 160 }
+};
+#define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
+static Note dynSeq[MAX_BEEPS * 2];            
+static const Note *seqPtr  = 0;
+static int         seqLen  = 0;
+static int         seqIdx  = 0;
+static uint32_t    noteEnd = 0;
+static uint32_t    busClock = 0;
+#if BUZZER_PASSIVE
+void PIT0_IRQHandler(void)
+{
+  PIT->CHANNEL[0].TFLG = PIT_TFLG_TIF_MASK;
+  PTA->PTOR = (1u << BUZZ_PIN);              
+}
+#endif
+static void toneOff(void)
+{
+#if BUZZER_PASSIVE
+  PIT->CHANNEL[0].TCTRL = 0;
+#endif
+  BUZZ_OFF();                                 
+}
+static void toneOn(uint32_t freq)
+{
+  if (freq == 0) { toneOff(); return; }
+#if BUZZER_PASSIVE
+  PIT->CHANNEL[0].TCTRL = 0;
+  PTA->PDDR |= (1u << BUZZ_PIN);              
+  PIT->CHANNEL[0].LDVAL = busClock / (2u * freq) - 1u;
+  PIT->CHANNEL[0].TFLG  = PIT_TFLG_TIF_MASK;
+  PIT->CHANNEL[0].TCTRL = PIT_TCTRL_TIE_MASK | PIT_TCTRL_TEN_MASK;
+#else
+  (void)freq;
+  BUZZ_ON();                                 
+#endif
+}
+static void startNote(void)
+{
+  toneOn(seqPtr[seqIdx].freq);
+  noteEnd = msTicks + seqPtr[seqIdx].ms;
+}
+static void playSeq(const Note *s, int n)
+{
+  seqPtr = s;
+  seqLen = n;
+  seqIdx = 0;
+  startNote();
+}
+
+static void playCountBeeps(int n)
+{
+  int i, k = 0;
+  if (n < 1) return;
+  if (n > MAX_BEEPS) n = ((n - 1) % MAX_BEEPS) + 1;
+  for (i = 0; i < n; i++) {
+      dynSeq[k].freq = N_C6; dynSeq[k].ms = BEEP_ON_MS;  k++;
+      if (i < n - 1) {
+          dynSeq[k].freq = 0; dynSeq[k].ms = BEEP_GAP_MS; k++;
+      }
+  }
+  playSeq(dynSeq, k);
+}
+static void soundCall(void)                    
+{
+#if CALL_COUNT_BEEP
+  playCountBeeps(calledQueue);
+#else
+  playSeq(SND_CALL, COUNT(SND_CALL));
+#endif
+}
+static void soundTick(void)   
+{
+  if (!seqPtr) return;
+  if ((int32_t)(msTicks - noteEnd) >= 0) {
+      if (++seqIdx >= seqLen) {
+          seqPtr = 0;
+          toneOff();
+      } else {
+          startNote();
+      }
+  }
+}
+/* 7-segment */
+static const uint8_t SEG_MAP[10] = {
+  0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90
+};
+#define SEG_BLANK 0xFF
+
+static const uint8_t SEG_LETTER[SERIES_COUNT] = {
+  0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E
+};
+
+static void queueSplit(int q, int *series, int *num)
+{
+  if (q <= 0) { *series = 0; *num = 0; return; }
+  *series = (q - 1) / PER_SERIES;
+  *num    = ((q - 1) % PER_SERIES) + 1;
+  if (*series >= SERIES_COUNT) *series = SERIES_COUNT - 1;
+}
+static void shiftOut(uint8_t b)
+{
+  int i;
+  for (i = 7; i >= 0; i--) {
+      if (b & (1u << i)) DATA_GPIO->PSOR = (1u << DATA_PIN);
+      else               DATA_GPIO->PCOR = (1u << DATA_PIN);
+      PTC->PSOR = (1u << CLOCK_PIN);
+      PTC->PCOR = (1u << CLOCK_PIN);
+  }
+}
+static void writeDigit(int digit, uint8_t seg)  
+{
+  PTB->PCOR = (1u << LATCH_PIN);
+  shiftOut(seg);
+  shiftOut((uint8_t)(1u << digit));
+  PTB->PSOR = (1u << LATCH_PIN);
+}
+static void displayScan(void)   
+{
+  static int digit = 0;
+  static const int DIV[4] = { 1000, 100, 10, 1 };
+  int v = displayValue;
+  uint8_t seg;
+  if ((int32_t)(msTicks - blankEnd) < 0) {            
+      seg = SEG_BLANK;
+  } else {
+      if (ticketFmt) {                                 
+          int s, n;
+          queueSplit(v, &s, &n);
+          if      (digit == 0) seg = SEG_BLANK;
+          else if (digit == 1) seg = SEG_LETTER[s];
+          else if (digit == 2) seg = SEG_MAP[n / 10];
+          else                 seg = SEG_MAP[n % 10];
+      } else if (digit == 3 || v >= DIV[digit])
+          seg = SEG_MAP[(v / DIV[digit]) % 10];
+      else
+          seg = SEG_BLANK;                             
+      if (dotMask & (1u << digit)) seg &= 0x7F;        
+  }
+  writeDigit(digit, seg);
+  digit = (digit + 1) & 3;
+}
+
+static void showCalled(void)    
+{
+  displayValue = calledQueue;
+  ticketFmt = 1;
+  dotMask = 0;
+  view = VIEW_CALLED;
+}
+
+static void feedback(uint32_t ledMask, const Note *snd, int n)
+{
+  PTD->PSOR = LED_ALL;                    
+  PTD->PCOR = ledMask;                    
+  blankEnd = msTicks + BLANK_MS;
+  lastActivity = msTicks;
+  if (snd) playSeq(snd, n);
+}
+
+static void issueTicket(void)                  /* S1 */
+{
+  ticketFmt = 1;
+  if (issuedQueue < MAX_QUEUE) {
+      issuedQueue++;
+      waitingQueue++;
+      displayValue = issuedQueue;
+      dotMask = 0;
+      view = VIEW_TICKET;
+      feedback(LED1_MASK, SND_ISSUE, COUNT(SND_ISSUE));
+  } else {                                   
+      displayValue = issuedQueue;
+      dotMask = 0;
+      view = VIEW_TICKET;
+      feedback(LED_ALL, SND_FULL, COUNT(SND_FULL));
+  }
+}
+static void showTotals(void)                   /* S2 */
+{
+  ticketFmt = 0;                              
+  if (view == VIEW_ISSUED) {                  
+      displayValue = waitingQueue;
+      dotMask = 0x0C;                         
+      view = VIEW_WAITING;
+  } else {                                   
+      displayValue = issuedQueue;
+      dotMask = 0x08;                         
+      view = VIEW_ISSUED;
+  }
+  feedback(LED2_MASK, SND_TOTAL, COUNT(SND_TOTAL));
+}
+static void callNext(void)                     /* S3 */
+{
+  if (waitingQueue > 0) {
+      calledQueue++;
+      waitingQueue--;
+      showCalled();
+      feedback(LED3_MASK, 0, 0);             
+      soundCall();
+  } else {
+      showCalled();
+      feedback(LED3_MASK, SND_NONE, COUNT(SND_NONE));
+  }
+}
+static void recallQueue(void)                  
+{
+  showCalled();
+  if (calledQueue > 0) {
+      feedback(LED3_MASK, 0, 0);
+      soundCall();
+  } else {
+      feedback(LED3_MASK, SND_NONE, COUNT(SND_NONE));
+  }
+}
+static void doReset(void)                      /* S1+S2 */
+{
+  issuedQueue = calledQueue = waitingQueue = 0;
+  showCalled();
+  feedback(LED_ALL, SND_RESET, COUNT(SND_RESET));
+}
+static void onPress(int idx)                   /* S1, S2 */
+{
+  if (idx == 0) issueTicket();
+  else          showTotals();
+}
+static void buttonsPoll(void)   /* 1 ms */
+{
+  static const uint32_t PIN[3] = { S1_PIN, S2_PIN, S3_PIN };
+  static int      stable[3] = { 0, 0, 0 };    
+  static int      count[3]  = { 0, 0, 0 };
+  static uint32_t hold[3]   = { 0, 0, 0 };    
+  static int      longDone  = 0;              
+  static int      resetDone = 0;              
+  int i, raw;
+  for (i = 0; i < 3; i++) {
+      raw = ((PTB->PDIR & (1u << PIN[i])) == 0) ? 1 : 0;
+      if (raw == stable[i]) {
+          count[i] = 0;
+      } else if (++count[i] >= DEBOUNCE_MS) {
+          stable[i] = raw;
+          count[i]  = 0;
+          hold[i]   = 0;
+          if (raw) {
+              if (i < 2) onPress(i);          
+          } else if (i == 2) {                
+              if (!longDone) callNext();      
+              longDone = 0;
+          }
+      }
+      if (stable[i] && hold[i] < 60000u) hold[i]++;
+  }
+  
+  if (stable[2] && !longDone && hold[2] >= LONG_MS) {
+      longDone = 1;
+      recallQueue();
+  }
+ 
+  if (stable[0] && stable[1]) {
+      if (!resetDone && hold[0] >= RESET_MS && hold[1] >= RESET_MS) {
+          resetDone = 1;
+          doReset();
+      }
+  } else {
+      resetDone = 0;
+  }
+}
+
+static void idleTick(void)   
+{
+  if (view != VIEW_CALLED && (int32_t)(msTicks - lastActivity) >= (int32_t)IDLE_MS)
+      showCalled();
+}
+
+void SysTick_Handler(void)
+{
+  msTicks++;
+}
+static void gpioInit(void)
+{
+  SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTB_MASK | SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTD_MASK;
+  
+  PORTA->PCR[BUZZ_PIN] = PORT_PCR_MUX(1);
+  BUZZ_OFF();
+ 
+  PORTB->PCR[LATCH_PIN]    = PORT_PCR_MUX(1);
+  PORTC->PCR[CLOCK_PIN]    = PORT_PCR_MUX(1);
+  DATA_PORT->PCR[DATA_PIN] = PORT_PCR_MUX(1);
+  PTB->PDDR |= (1u << LATCH_PIN);
+  PTC->PDDR |= (1u << CLOCK_PIN);
+  DATA_GPIO->PDDR |= (1u << DATA_PIN);
+  
+  PORTD->PCR[LED1_PIN] = PORT_PCR_MUX(1);
+  PORTD->PCR[LED2_PIN] = PORT_PCR_MUX(1);
+  PORTD->PCR[LED3_PIN] = PORT_PCR_MUX(1);
+  PTD->PSOR  = LED_ALL;
+  PTD->PDDR |= LED_ALL;
+  
+  PORTB->PCR[S1_PIN] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+  PORTB->PCR[S2_PIN] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+  PORTB->PCR[S3_PIN] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+  PTB->PDDR &= ~((1u << S1_PIN) | (1u << S2_PIN) | (1u << S3_PIN));
+}
+static void soundInit(void)
+{
+  uint32_t div1 = ((SIM->CLKDIV1 & SIM_CLKDIV1_OUTDIV1_MASK) >> SIM_CLKDIV1_OUTDIV1_SHIFT) + 1u;
+  uint32_t div2 = ((SIM->CLKDIV1 & SIM_CLKDIV1_OUTDIV2_MASK) >> SIM_CLKDIV1_OUTDIV2_SHIFT) + 1u;
+  busClock = (SystemCoreClock * div1) / div2;   /* Bus clock */
+#if BUZZER_PASSIVE
+  SIM->SCGC6 |= SIM_SCGC6_PIT_MASK;
+  PIT->MCR = 0;                                 
+  PIT->CHANNEL[0].TCTRL = 0;
+  NVIC_EnableIRQ(PIT0_IRQn);
+#endif
+  toneOff();
+}
+int main(void)
+{
+  uint32_t last = 0;
+  SystemCoreClockUpdate();
+  gpioInit();
+  soundInit();
+  issuedQueue = calledQueue = waitingQueue = 0;   /* RESET */
+  showCalled();
+  SysTick_Config(SystemCoreClock / 1000u);        /* 1 ms */
+  for (;;) {
+      if (msTicks != last) {
+          last = msTicks;
+          displayScan();
+          buttonsPoll();
+          soundTick();
+          idleTick();
+      }
+#if USE_WFI
+      else {
+          __WFI();                                /* SysTick */
+      }
+#endif
+  }
+}
+ 
+ 
